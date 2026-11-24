@@ -1,0 +1,1 @@
+- Fixed :ref:`spacecraftReconfig` starting each burn late by truncating the half-burn time to whole seconds. Burns now start ``thrustOnTime / (2 * numThrusters)`` before the impulsive burn time and are centered on it (#1718).

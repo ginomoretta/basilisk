@@ -24,6 +24,7 @@
 #   Creation Date:      March 27, 2020
 #
 
+import numpy as np
 import pytest
 from Basilisk.architecture import messaging
 from Basilisk.fswAlgorithms import spacecraftReconfig  # import the module that is to be tested
@@ -188,6 +189,100 @@ def spacecraftReconfigTestFunction(show_plots, useRefAttitude, accuracy):
     # each test method requires a single assert method to be called
     # this check below just makes sure no sub-test failures were found
     return [testFailCount, ''.join(testMessages)]
+
+
+def test_spacecraftReconfigBurnCentering():
+    """Verify each executed burn starts half of its per-thruster duration before
+    the impulsive burn time, so the burn is centered on that time.
+
+    The deputy is offset from the chief by small orbit element differences, which
+    schedules three burns within one chief orbit. The first burn lasts 9.012 s
+    on each of two thrusters, so it must start 2.253 s before the impulsive burn
+    time. Truncating the burn duration to whole seconds gives 2 s instead and
+    starts the burn late.
+    """
+    unitTaskName = "unitTask"
+    unitProcessName = "TestProcess"
+    unitTestSim = SimulationBaseClass.SimBaseClass()
+    testProcessRate = macros.sec2nano(0.1)  # [ns]
+    dt = testProcessRate * macros.NANO2SEC  # [s]
+    testProc = unitTestSim.CreateNewProcess(unitProcessName)
+    testProc.addTask(unitTestSim.CreateNewTask(unitTaskName, testProcessRate))
+
+    module = spacecraftReconfig.spacecraftReconfig()
+    module.ModelTag = "spacecraftReconfig"
+    module.targetClassicOED = [0.0000, 0.0000, 0.0000, 0.0001, 0.0002, 0.0003]
+    module.attControlTime = 400  # [s]
+    module.mu = orbitalMotion.MU_EARTH * 1e9  # [m^3/s^2]
+    unitTestSim.AddModelToTask(unitTaskName, module)
+
+    oe = orbitalMotion.ClassicElements()
+    oe.a = 20000e3  # [m]
+    oe.e = 0.1
+    oe.i = 0.2  # [rad]
+    oe.Omega = 0.3  # [rad]
+    oe.omega = 0.4  # [rad]
+    oe.f = 0.5  # [rad]
+    (r_BN_N, v_BN_N) = orbitalMotion.elem2rv(module.mu, oe)
+    chiefNavData = messaging.NavTransMsgPayload()
+    chiefNavData.r_BN_N = r_BN_N
+    chiefNavData.v_BN_N = v_BN_N
+    chiefInMsg = messaging.NavTransMsg().write(chiefNavData)
+    module.chiefTransInMsg.subscribeTo(chiefInMsg)
+
+    oe2 = orbitalMotion.ClassicElements()
+    oe2.a = oe.a * (1 + 0.0001)  # [m]
+    oe2.e = oe.e + 0.0001
+    oe2.i = oe.i + 0.0001  # [rad]
+    oe2.Omega = oe.Omega + 0.0001  # [rad]
+    oe2.omega = oe.omega + 0.0001  # [rad]
+    oe2.f = oe.f + 0.0001  # [rad]
+    (r_BN_N2, v_BN_N2) = orbitalMotion.elem2rv(module.mu, oe2)
+    deputyNavData = messaging.NavTransMsgPayload()
+    deputyNavData.r_BN_N = r_BN_N2
+    deputyNavData.v_BN_N = v_BN_N2
+    deputyInMsg = messaging.NavTransMsg().write(deputyNavData)
+    module.deputyTransInMsg.subscribeTo(deputyInMsg)
+
+    vehicleConfigInData = messaging.VehicleConfigMsgPayload()
+    vehicleConfigInData.massSC = 500  # [kg]
+    vehicleConfigMsg = messaging.VehicleConfigMsg().write(vehicleConfigInData)
+    module.vehicleConfigInMsg.subscribeTo(vehicleConfigMsg)
+
+    numThrusters = 2
+    fswSetupThrusters.clearSetup()
+    for _ in range(numThrusters):
+        # location [m], direction [-], maximum thrust [N]
+        fswSetupThrusters.create([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 22.6)
+    thrConfMsg = fswSetupThrusters.writeConfigMessage()
+    module.thrustConfigInMsg.subscribeTo(thrConfMsg)
+
+    # thrustOnFlag is 1 only on the update that commands a burn
+    moduleLog = module.logger("thrustOnFlag")
+    unitTestSim.AddModelToTask(unitTaskName, moduleLog)
+
+    unitTestSim.InitializeSimulation()
+    # stop before the module resets its burn schedule after one chief orbit period
+    unitTestSim.ConfigureStopTime(macros.sec2nano(28000.0))  # [ns]
+    unitTestSim.ExecuteSimulation()
+
+    thrustOnFlag = np.array(moduleLog.thrustOnFlag)
+    burnStartTimes = moduleLog.times()[thrustOnFlag == 1] * macros.NANO2SEC  # [s]
+
+    burnArray = module.burnArrayInfoOutMsgBuffer.burnArray
+    burns = [messaging.ReconfigBurnArray_getitem(burnArray, i) for i in range(3)]
+    executedBurns = [burn for burn in burns if burn.flag == 2]
+    assert len(executedBurns) == 3
+    assert len(burnStartTimes) == len(executedBurns)
+
+    for burn, tStart in zip(executedBurns, burnStartTimes):
+        halfBurn = burn.thrustOnTime / (2 * numThrusters)  # [s]
+        # the module timer starts at its second update, so it lags the simulation time by one step
+        tModule = tStart - dt  # [s]
+        # the burn starts at the first update where the remaining time is below halfBurn
+        assert burn.t - halfBurn < tModule <= burn.t - halfBurn + dt + 1e-9, (
+            f"burn at t={burn.t} s with half duration {halfBurn} s started at {tModule} s"
+        )
 
 
 #
